@@ -1,0 +1,96 @@
+# Section 6 (Identification Cross-Checks) — National Time-Series Essentials
+# Outputs: /mnt/data/section6_ts/table_S6_1_IV_lag12_2SPS.csv
+#          /mnt/data/section6_ts/table_S6_2_placebo_time_permutation.csv
+import os, warnings, numpy as np, pandas as pd
+import statsmodels.api as sm, statsmodels.formula.api as smf
+warnings.filterwarnings("ignore")
+
+OUTDIR = "section6"; os.makedirs(OUTDIR, exist_ok=True)
+
+# 1) Load national monthly series
+paths = ["panel_us_monthly.csv"]
+for p in paths:
+    if os.path.exists(p):
+        df = pd.read_csv(p); df["_source"]=p; break
+else:
+    raise RuntimeError("No national series found.")
+
+# 2) Robust column detection
+def find_first(cands, required=True):
+    low = {c:c.lower() for c in df.columns}
+    for cand in cands:
+        for c in df.columns:
+            if cand in low[c]: return c
+    if required: raise KeyError(f"Need column like {cands}")
+    return None
+
+date_col = find_first(["date"])
+infl_col = find_first(["inflation_yoy_pct","inflation_yoy","inflation"])
+u_gap_col = find_first(["u_gap_pct_points","u_gap","unemployment_gap"])
+ai_col   = find_first(["ai_share_pct","ai_share_postings","ai_share","ai_intensity"])
+
+opt_controls = []
+for cand in ["cpi_energy_yoy_pct","energy","dxy_yoy_pct","dxy",
+             "productivity_yoy_pct","productivity",
+             "jolts_job_openings_rate_pct","jolts"]:
+    c = find_first([cand], required=False)
+    if c and c not in opt_controls: opt_controls.append(c)
+
+# 3) Prep series
+df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+df = df.dropna(subset=[date_col, infl_col, u_gap_col, ai_col]).sort_values(date_col).copy()
+df["infl_lag1"]  = df[infl_col].shift(1)
+df["infl_lag12"] = df[infl_col].shift(12)
+df["u_gap_c"] = df[u_gap_col] - df[u_gap_col].mean()
+df["ai_c"]    = df[ai_col]    - df[ai_col].mean()
+df["uxA"]     = df["u_gap_c"] * df["ai_c"]
+df["ai_lag12"]   = df[ai_col].shift(12)
+df["ai_lag12_c"] = df["ai_lag12"] - df["ai_lag12"].mean()
+df = df.dropna(subset=[infl_col,"u_gap_c","ai_c","uxA","infl_lag1","infl_lag12","ai_lag12_c"]).copy()
+
+# 4) First stage: ai_c ~ ai_lag12_c + controls (HAC(12))
+rhs_fs = "ai_lag12_c" + ((" + " + " + ".join(opt_controls)) if opt_controls else "")
+fs_res = smf.ols(f"ai_c ~ {rhs_fs}", data=df).fit(cov_type="HAC", cov_kwds={"maxlags":12})
+t_ai = fs_res.tvalues.get("ai_lag12_c", np.nan)
+F_first_stage = float(t_ai**2) if pd.notna(t_ai) else np.nan
+
+# 5) Second stage (2SPS with HAC): y ~ u_gap_c + (u_gap_c × âi) + inflation lags + controls
+df["ai_hat"]    = fs_res.fittedvalues
+df["ai_hat_c"]  = df["ai_hat"] - df["ai_hat"].mean()
+df["uxA_hat"]   = df["u_gap_c"] * df["ai_hat_c"]
+rhs_ss = "u_gap_c + uxA_hat + infl_lag1 + infl_lag12" + ((" + " + " + ".join(opt_controls)) if opt_controls else "")
+ss_res = smf.ols(f"{infl_col} ~ {rhs_ss}", data=df).fit(cov_type="HAC", cov_kwds={"maxlags":12})
+
+beta2_iv = ss_res.params.get("uxA_hat", np.nan)
+se2_iv   = ss_res.bse.get("uxA_hat", np.nan)
+t2_iv    = ss_res.tvalues.get("uxA_hat", np.nan)
+p2_iv    = ss_res.pvalues.get("uxA_hat", np.nan)
+
+tbl_iv = pd.DataFrame({
+    "Metric": ["First-stage F (ai_lag12 → ai)",
+               "β2^IV (u_gap × A_hat)", "Std. Error", "t-stat", "p-value"],
+    "Value":  [F_first_stage, beta2_iv, se2_iv, t2_iv, p2_iv]
+})
+tbl_iv.to_csv(f"{OUTDIR}/table_S6_1_IV_lag12_2SPS.csv", index=False)
+
+# 6) Placebo: permute AI over time (HAC(12))
+rng = np.random.default_rng(20250919)
+ai_perm = df[ai_col].to_numpy().copy(); rng.shuffle(ai_perm)
+df["ai_perm_c"]   = ai_perm - ai_perm.mean()
+df["uxA_placebo"] = df["u_gap_c"] * df["ai_perm_c"]
+
+pl_rhs  = "u_gap_c + uxA_placebo + infl_lag1 + infl_lag12" + ((" + " + " + ".join(opt_controls)) if opt_controls else "")
+pl_res  = smf.ols(f"{infl_col} ~ {pl_rhs}", data=df).fit(cov_type="HAC", cov_kwds={"maxlags":12})
+
+tbl_pl = pd.DataFrame({
+    "Parameter": ["β2 (u_gap × AI_perm)"],
+    "Estimate":  [pl_res.params.get("uxA_placebo", np.nan)],
+    "Std. Error":[pl_res.bse.get("uxA_placebo", np.nan)],
+    "t-stat":    [pl_res.tvalues.get("uxA_placebo", np.nan)],
+    "p-value":   [pl_res.pvalues.get("uxA_placebo", np.nan)]
+})
+tbl_pl.to_csv(f"{OUTDIR}/table_S6_2_placebo_time_permutation.csv", index=False)
+
+print("Saved:",
+      f"{OUTDIR}/table_S6_1_IV_lag12_2SPS.csv",
+      f"{OUTDIR}/table_S6_2_placebo_time_permutation.csv", sep="\n")
